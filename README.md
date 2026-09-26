@@ -4,6 +4,10 @@
 
 版本：1.0　|　作者：圣骷髅　|　适用：Windows 10/11 双屏（多显示器）用户
 
+<img width="125" height="165" alt="image" src="https://github.com/user-attachments/assets/29125846-51da-4ba5-9043-abdf1283080d" />
+
+<img width="333" height="234" alt="133599b2-2920-4fbb-97c1-77353b7a269e" src="https://github.com/user-attachments/assets/0be678ad-1ab6-4dcf-87c6-76e0ed510116" />
+
 ---
 
 ## 一、软件简介
