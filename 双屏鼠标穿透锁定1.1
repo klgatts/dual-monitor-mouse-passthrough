@@ -1,0 +1,689 @@
+;@Ahk2Exe-SetDescription  双屏鼠标穿透工具
+;@Ahk2Exe-SetCopyright    Copyright (c) 2026 圣骷髅
+;@Ahk2Exe-SetFileVersion  1.1
+;@Ahk2Exe-SetProductName  双屏鼠标穿透锁定
+;@Ahk2Exe-SetProductVersion 1.1
+;@Ahk2Exe-SetOrigFilename 双屏鼠标穿透锁定.ahk
+; ============================================================
+;  双屏鼠标穿透锁定: 穿透快捷键单击 解锁/锁定, 双击 暂停/播放副屏媒体
+;  只锁主屏模式: 解锁后3秒未穿透到副屏自动重锁
+;  锁定模式(托盘切换, 自动记忆, 默认只锁主屏) | 任务管理器/提权窗口放行
+;  长按穿透键500ms=向副屏发送自定义按键(托盘可改, ini记忆)
+;  托盘可选择主屏幕(设备名记忆) | 配置跟随脚本名.ini
+; ============================================================
+
+#Requires AutoHotkey v2.0
+#SingleInstance Force
+
+; ---------- 全局配置 ----------
+if !DllCall("user32.dll\SetProcessDpiAwarenessContext", "Ptr", -4)
+    DllCall("user32.dll\SetProcessDPIAware")
+MAIN_MONITOR := 0
+POLL_MS := 10
+lastDown := 0                                  ; 上次穿透键按下时刻(双击检测)
+CONFIG := A_ScriptDir "\" . RegExReplace(A_ScriptName, "\.(ahk|exe)$", "") . ".ini"
+; 首次运行: 旧的固定名配置文件自动迁移(热键/模式记忆不丢失)
+if !FileExist(CONFIG) && FileExist(A_ScriptDir "\双屏锁定配置.ini")
+    FileCopy(A_ScriptDir "\双屏锁定配置.ini", CONFIG)
+showTips := IniRead(CONFIG, "设置", "showTips", "1") = "1"
+lockMode := IniRead(CONFIG, "设置", "lockMode", "1")            ; 1=主屏 2=当前屏
+lockMode := lockMode = "2" || lockMode = "当前屏" ? "当前屏" : "主屏"   ; 兼容旧写法
+secKey := AhkFromDisplay(IniRead(CONFIG, "热键", "secKey", IniRead(CONFIG, "设置", "secKey", "Space")))   ; 长按500ms发送到副屏最顶层窗口的按键
+if IniRead(CONFIG, "热键", "secKey", "") != DisplayHotkey(secKey)
+    IniWrite(DisplayHotkey(secKey), CONFIG, "热键", "secKey")
+savedPrimary := IniRead(CONFIG, "设置", "primaryMonitor", "")
+MAIN_MONITOR := MonitorGetPrimary()
+if savedPrimary != "" {
+    Loop MonitorGetCount() {
+        try {
+            if MonitorGetName(A_Index) = savedPrimary {
+                MAIN_MONITOR := A_Index
+                break
+            }
+        }
+    }
+}
+state := 0, suspended := false, bypass := false, unlockArmed := false, holdFired := false
+UnlockHotkey := "", PauseHotkey := ""
+mL := 0, mT := 0, mR := 0, mB := 0, sL := 0, sT := 0, sR := 0, sB := 0
+clipRect := Buffer(16, 0), clipRectSec := Buffer(16, 0)
+AUTOSTART_KEY := "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME := "双屏鼠标穿透锁定"
+MEDIA_PROCS := ["msedge.exe", "chrome.exe", "firefox.exe", "potplayer64.exe", "potplayer.exe", "potplayermini64.exe", "potplayermini.exe", "vlc.exe", "wmplayer.exe", "cloudmusic.exe", "kugou.exe", "qqmusic.exe", "foobar2000.exe"]
+CHROMIUM_PROCS := ["msedge.exe", "chrome.exe", "firefox.exe"]
+MOD_VK := Map("#", 0x5B, "!", 0x12, "^", 0x11, "+", 0x10)
+MOD_NAME := Map("#", "LWin", "!", "LAlt", "^", "LCtrl", "+", "LShift")
+
+; ---------- 核心工具 ----------
+GetCursor(&x, &y) {
+    pt := Buffer(8, 0)
+    DllCall("user32.dll\GetCursorPos", "Ptr", pt)
+    x := NumGet(pt, 0, "Int"), y := NumGet(pt, 4, "Int")
+}
+InMain(x, y) {
+    global mL, mT, mR, mB
+    return x >= mL && x < mR && y >= mT && y < mB
+}
+ClipToMain() {
+    global clipRect
+    DllCall("user32.dll\ClipCursor", "Ptr", clipRect)
+}
+ClipToSec() {
+    global clipRectSec
+    DllCall("user32.dll\ClipCursor", "Ptr", clipRectSec)
+}
+ReleaseClip() {
+    DllCall("user32.dll\ClipCursor", "Ptr", 0)
+}
+ShowTip(t) {
+    global showTips
+    if showTips
+        ToolTip(t), SetTimer((*) => ToolTip(), -1500)
+}
+SetRect(buf, l, t, r, b) {
+    NumPut("Int", l, buf, 0), NumPut("Int", t, buf, 4)
+    NumPut("Int", r, buf, 8), NumPut("Int", b, buf, 12)
+}
+; ---------- 前台检测 ----------
+; 前台进程是否提权(任务管理器等管理员程序)
+IsFgElevated() {
+    hWnd := DllCall("user32.dll\GetForegroundWindow", "Ptr")
+    if !hWnd
+        return false
+    pid := 0
+    DllCall("user32.dll\GetWindowThreadProcessId", "Ptr", hWnd, "UInt*", &pid)
+    if !pid
+        return false
+    hProc := DllCall("kernel32.dll\OpenProcess", "UInt", 0x1000, "Int", 0, "UInt", pid, "Ptr")
+    if !hProc
+        return false
+    hTok := 0
+    DllCall("advapi32.dll\OpenProcessToken", "Ptr", hProc, "UInt", 0x0008, "Ptr*", &hTok)
+    DllCall("kernel32.dll\CloseHandle", "Ptr", hProc)
+    if !hTok
+        return false
+    buf := Buffer(4, 0), rl := 0
+    ; ReturnLength 必须用变量接收(NULL 会返回 ERROR_NOACCESS 导致检测失效)
+    r := DllCall("advapi32.dll\GetTokenInformation", "Ptr", hTok, "Int", 20, "Ptr", buf, "UInt", 4, "UInt*", &rl)
+    DllCall("kernel32.dll\CloseHandle", "Ptr", hTok)
+    return r && NumGet(buf, 0, "Int") != 0
+}
+; 提权进程 或 任务管理器窗口 → 临时放行
+IsBypassFocus() {
+    if IsFgElevated()
+        return true
+    try
+        return WinGetClass(DllCall("user32.dll\GetForegroundWindow", "Ptr")) = "TaskManagerWindow"
+    catch
+        return false
+}
+
+; ---------- 状态机 ----------
+; 状态: 0=锁主屏 1=穿透 2=锁副屏(当前屏模式)/副屏自由(主屏模式)
+LockCheck() {
+    global state, suspended, bypass, lockMode
+    if suspended
+        return
+    if IsBypassFocus() {
+        if !bypass
+            bypass := true, ReleaseClip(), ShowTip("焦点在系统窗口 · 已临时放行鼠标")
+    } else if bypass {
+        bypass := false
+        GetCursor(&x, &y)
+        state := InMain(x, y) ? 0 : 2
+        ShowTip("已恢复锁定")
+    }
+    if bypass
+        return
+    GetCursor(&x, &y)
+    if state = 0 {
+        ClipToMain()
+    } else if state = 1 {
+        if lockMode = "主屏" && !InMain(x, y)
+            state := 2, ShowTip("已进入副屏幕 · 移回主屏即重新锁定")
+    } else if state = 2 {
+        if lockMode = "主屏" {
+            if InMain(x, y)
+                state := 0, ShowTip("已回到主屏幕 · 重新锁定")
+        } else
+            ClipToSec()
+    }
+}
+; 穿透快捷键: 单击 = 解锁↔锁定; 双击(400ms内) = 暂停/播放副屏媒体; 长按(≥500ms) = 发送副屏自定义按键
+UnlockDown(*) {
+    global unlockArmed, holdFired, lastDown, UnlockHotkey
+    if A_TickCount - lastDown < 400 {          ; 快速第二次按下 → 双击(支持按住修饰键连按)
+        lastDown := A_TickCount
+        unlockArmed := false
+        SetTimer(DoSingleClick, 0)             ; 取消挂起的单击
+        SetTimer(CheckLongHold, 0)             ; 取消长按检查
+        ReleaseSpecMods(UnlockHotkey)          ; 自动弹起Ctrl/Alt等修饰键
+        Sleep(30)                              ; 等浏览器更新修饰键状态
+        ToggleMedia()
+        return
+    }
+    lastDown := A_TickCount
+    unlockArmed := true
+    holdFired := false
+    SetTimer(CheckLongHold, -500)            ; 500ms 后检查是否长按
+}
+UnlockUp(*) {
+    global unlockArmed, suspended, bypass, holdFired
+    SetTimer(CheckLongHold, 0)               ; 取消长按检查
+    if suspended || bypass || !unlockArmed
+        return
+    unlockArmed := false
+    if holdFired {                            ; 已触发长按发送 → 本次按压不算单击/双击
+        holdFired := false
+        return
+    }
+    SetTimer(DoSingleClick, -400)             ; 400ms 后执行单击(期间再按则转为双击)
+}
+; 长按500ms: 自动弹起特殊键后发送副屏自定义按键(不改变穿透状态)
+CheckLongHold() {
+    global unlockArmed, holdFired, UnlockHotkey
+    ; 500ms内未松手(弹起回调已取消本定时器) → 确属长按
+    if !unlockArmed || holdFired
+        return
+    holdFired := true
+    ReleaseSpecMods(UnlockHotkey)            ; 注入弹起Ctrl/Alt等修饰键
+    Sleep(30)                                ; 等系统/浏览器更新修饰键状态
+    SendSecKey()
+}
+; 单击: 穿透 解锁/锁定(按当前模式)
+DoSingleClick(*) {
+    global state, lockMode
+    if state = 0 {
+        state := 1, ReleaseClip(), ShowTip("已解锁 · 可穿透到副屏幕")
+        if lockMode = "主屏"
+            SetTimer(ReLockIfIdle, -3000)     ; 只锁主屏: 3秒未穿透自动重锁
+    } else if state = 1 {
+        GetCursor(&x, &y)
+        if lockMode = "当前屏" && !InMain(x, y)
+            state := 2, ClipToSec(), ShowTip("已锁定副屏幕")
+        else
+            state := 0, ClipToMain(), ShowTip("已锁定主屏幕")
+    } else if state = 2 {
+        if lockMode = "当前屏"
+            state := 1, ReleaseClip(), ShowTip("已解锁 · 可穿透到副屏幕")
+        else
+            state := 0, ClipToMain(), ShowTip("已锁定主屏幕")
+    }
+}
+; 只锁主屏模式: 解锁后 3 秒未穿透到副屏 → 自动重新锁定
+ReLockIfIdle() {
+    global state, suspended, bypass, lockMode
+    if state = 1 && lockMode = "主屏" && !suspended && !bypass {
+        state := 0
+        ClipToMain()
+        ShowTip("3秒未穿透 · 已重新锁定")
+    }
+}
+; ---------- 副屏自定义按键(长按穿透键500ms触发) ----------
+; 解析AHK记法: 前缀修饰符 #!^+ + 主键名
+ParseSpec(spec, &mods, &keyName) {
+    mods := "", keyName := spec
+    while keyName != "" && InStr("#!^+", SubStr(keyName, 1, 1)) {
+        mods .= SubStr(keyName, 1, 1)
+        keyName := SubStr(keyName, 2)
+    }
+}
+; 注入修饰键真实状态: down=1按下 0弹起
+InjectMods(mods, down) {
+    for m in ["#", "!", "^", "+"]
+        if InStr(mods, m)
+            DllCall("user32.dll\keybd_event", "UChar", MOD_VK[m], "UChar", 0, "UInt", down ? 0 : 2, "UPtr", 0)
+}
+; 注入弹起热键中的修饰键(Ctrl/Alt/Shift/Win), 让系统认为修饰键已释放
+ReleaseSpecMods(spec) {
+    ParseSpec(spec, &mods, &keyName)
+    InjectMods(mods, 0)
+}
+; 人类可读热键转AHK记法, 如 "Ctrl+NumpadMult" → "^NumpadMult"; 已是AHK记法则原样返回
+AhkFromDisplay(s) {
+    if !RegExMatch(s, "^(L|R)?(Ctrl|Alt|Shift|Win)\+")
+        return s
+    for p in [["LCtrl+", "^"], ["RCtrl+", "^"], ["Ctrl+", "^"], ["LAlt+", "!"], ["RAlt+", "!"], ["Alt+", "!"], ["LShift+", "+"], ["RShift+", "+"], ["Shift+", "+"], ["LWin+", "#"], ["RWin+", "#"], ["Win+", "#"]]
+        s := StrReplace(s, p[1], p[2])
+    for p in [["Num*", "NumpadMult"], ["Num/", "NumpadDiv"], ["Num+", "NumpadAdd"], ["Num-", "NumpadSub"], ["Num.", "NumpadDot"], ["NumEnter", "NumpadEnter"]]
+        s := StrReplace(s, p[1], p[2])
+    return RegExReplace(s, "^Num(\d)$", "Numpad$1")
+}
+; 目标线程当前键盘焦点窗口(优先子控件如EDIT, 失败返回主窗口)
+FocusChild(tid, hwnd) {
+    gi := Buffer(72, 0)
+    NumPut("UInt", 72, gi, 0)
+    if DllCall("user32.dll\GetGUIThreadInfo", "UInt", tid, "Ptr", gi) {
+        f := NumGet(gi, 16, "Ptr")            ; 64位: hwndFocus 偏移16
+        if f
+            return f
+    }
+    return hwnd
+}
+; 真实输入注入(potplayer等需真实按键): 临时激活窗口+SendInput, 发送后恢复原前台
+SendKeyDirect(hwnd, spec) {
+    ; potplayer等媒体程序不响应空格, 其播放/暂停绑定键盘播放键 → 空格自动映射为播放键(与硬件键一致)
+    if spec = "Space" || spec = " "
+        spec := "Media_Play_Pause"
+    ParseSpec(spec, &mods, &keyName)
+    prevActive := WinGetID("A")
+    if prevActive != hwnd {
+        WinActivate("ahk_id " hwnd)
+        Sleep(60)
+        if !WinActive("ahk_id " hwnd) {       ; 前台锁定拦截 → AttachThreadInput+SetForegroundWindow 强制前台
+            tid2 := DllCall("user32.dll\GetWindowThreadProcessId", "Ptr", hwnd, "Ptr", 0, "UInt")
+            myTid := DllCall("kernel32.dll\GetCurrentThreadId", "UInt")
+            DllCall("user32.dll\AttachThreadInput", "UInt", myTid, "UInt", tid2, "Int", 1)
+            DllCall("user32.dll\SetForegroundWindow", "Ptr", hwnd)
+            DllCall("user32.dll\AttachThreadInput", "UInt", myTid, "UInt", tid2, "Int", 0)
+            Sleep(60)
+        }
+    }
+    Sleep(80)
+    str := ""
+    for m in ["#", "!", "^", "+"]
+        if InStr(mods, m)
+            str .= "{" MOD_NAME[m] " down}"
+    kv := GetKeyVK(keyName)
+    if kv != 0 {
+        str .= "{vk" Format("{:02X}", kv) "}"
+        str .= "{vk" Format("{:02X}", kv) " up}"
+    }
+    for m in ["+", "^", "!", "#"]
+        if InStr(mods, m)
+            str .= "{" MOD_NAME[m] " up}"
+    if str != ""
+        SendInput(str)
+    Sleep(50)
+    if prevActive && prevActive != hwnd
+        WinActivate("ahk_id " prevActive)   ; 恢复原前台窗口
+}
+; 借焦点+PostMessage发送组合键/单键到目标窗口(不抢前台, 不额外发Home)
+SendKeySpec(hwnd, spec) {
+    pn := WinGetProcessName("ahk_id " hwnd)
+    ParseSpec(spec, &mods, &keyName)
+    ; 组合键(Ctrl+R/Alt+A等)或媒体播放器 → 真实注入: 全局热键(截图等)与程序内快捷键都有效
+    if mods != "" || (IsProcIn(pn, MEDIA_PROCS) && !IsProcIn(pn, CHROMIUM_PROCS)) {
+        SendKeyDirect(hwnd, spec)
+        return
+    }
+    tid := DllCall("user32.dll\GetWindowThreadProcessId", "Ptr", hwnd, "Ptr", 0, "UInt")
+    myTid := DllCall("kernel32.dll\GetCurrentThreadId", "UInt")
+    prev := DllCall("user32.dll\GetFocus", "Ptr")
+    DllCall("user32.dll\AttachThreadInput", "UInt", myTid, "UInt", tid, "Int", 1)
+    DllCall("user32.dll\SetFocus", "Ptr", hwnd)
+    Sleep(80)                                ; 等目标更新内部焦点
+    pn := WinGetProcessName("ahk_id " hwnd)
+    target := (IsProcIn(pn, CHROMIUM_PROCS) || IsProcIn(pn, MEDIA_PROCS)) ? hwnd : FocusChild(tid, hwnd)   ; 媒体/浏览器发主窗口(加速键), 普通应用发焦点控件(字符输入)
+    ; PostMessage 完整按键(带扫描码lParam): 不依赖前台窗口, 主屏有焦点时副屏也能接收
+    kv := GetKeyVK(keyName)
+    lpD := 1, lpU := (1 << 30) | (1 << 31) | 1
+    if kv != 0 {
+        sc := DllCall("user32.dll\MapVirtualKeyW", "UInt", kv, "UInt", 0)
+        lpD := (sc << 16) | 1
+        lpU := (sc << 16) | (1 << 30) | (1 << 31) | 1
+    }
+    ; 修饰键用keybd_event注入真实状态(Chromium按GetKeyState识别组合键, PostMessage不更新键状态)
+    InjectMods(mods, 1)
+    if kv != 0 {
+        DllCall("user32.dll\PostMessage", "Ptr", target, "UInt", 0x0100, "UPtr", kv, "Ptr", lpD)
+        Sleep(30)
+        DllCall("user32.dll\PostMessage", "Ptr", target, "UInt", 0x0101, "UPtr", kv, "Ptr", lpU)
+    }
+    InjectMods(mods, 0)
+    Sleep(50)
+    if prev {                                ; 还回键盘焦点
+        pTid := DllCall("user32.dll\GetWindowThreadProcessId", "Ptr", prev, "Ptr", 0, "UInt")
+        DllCall("user32.dll\AttachThreadInput", "UInt", myTid, "UInt", pTid, "Int", 1)
+        DllCall("user32.dll\SetFocus", "Ptr", prev)
+        DllCall("user32.dll\AttachThreadInput", "UInt", myTid, "UInt", pTid, "Int", 0)
+    }
+    DllCall("user32.dll\AttachThreadInput", "UInt", myTid, "UInt", tid, "Int", 0)
+}
+; 长按500ms触发: 找副屏目标窗口并发送配置的按键
+SendSecKey() {
+    global secKey
+    if secKey = ""
+        return ShowTip("副屏按键未设置(托盘右键可设置)")
+    hwnd := TopWindowOnSec()                   ; 发到副屏最顶层窗口(记事本/potplayer等)
+    if !hwnd
+        return ShowTip("副屏未找到目标窗口, 无法发送按键")
+    SendKeySpec(hwnd, secKey)
+    ShowTip("已发送到副屏: " . DisplayHotkey(secKey))
+}
+; 托盘: 修改副屏按键(按下新组合键/单键, Esc取消)
+SetSecKey(*) {
+    global secKey, CONFIG, UnlockHotkey, PauseHotkey
+    ToolTip("修改「发送到副屏按键`n当前: " . (secKey = "" ? "(未设置)" : DisplayHotkey(secKey)) . "`n请按下新的组合键或单键, 按 Esc 取消")
+    new := CaptureHotkey()
+    ToolTip()
+    if new = ""
+        return ShowTip("已取消修改, 副屏按键未变")
+    if new = UnlockHotkey || new = PauseHotkey
+        return ShowTip("与穿透/暂停快捷键相同, 请重试")
+    secKey := new
+    IniWrite(DisplayHotkey(new), CONFIG, "热键", "secKey")
+    ShowTip("副屏按键已改为: " . DisplayHotkey(new))
+    BuildTrayMenu()
+}
+
+; 双击: 暂停/播放 副屏上的媒体(浏览器/播放器/音乐)
+ToggleMedia() {
+    hwnd := FindMediaOnSec()
+    if !hwnd
+        return ShowTip("副屏未找到媒体窗口, 无法控制")
+    if IsProcIn(WinGetProcessName("ahk_id " hwnd), CHROMIUM_PROCS) {
+        SendKeySpec(hwnd, "Space")           ; 空格播放/暂停且不滚动(无需Home回弹)
+        ShowTip("已发送 播放/暂停 · 副屏浏览器")
+    } else {
+        DllCall("user32.dll\SendMessage", "Ptr", hwnd, "UInt", 0x0319, "UPtr", 0, "Ptr", (0x0E << 16))
+        ShowTip("已发送 播放/暂停 · 副屏媒体")
+    }
+}
+; 副屏上找媒体窗口: Z序最前且面积≥副屏1/4(避开画中画); 无媒体取最上层非媒体窗口兜底
+FindMediaOnSec() {
+    global sL, sT, sR, sB
+    minArea := (sR - sL) * (sB - sT) // 4     ; 小于副屏1/4视为画中画/瞬态小窗
+    mediaBest := 0
+    best := 0
+    for h in WinGetList() {                    ; Z序: 顶层在前
+        try {
+            if WinGetMinMax("ahk_id " h) = -1   ; 跳过最小化
+                continue
+            WinGetPos(&x, &y, &w, &hh, "ahk_id " h)
+            if w <= 0 || hh <= 0
+                continue
+            cx := x + w / 2, cy := y + hh / 2
+            if cx < sL || cx >= sR || cy < sT || cy >= sB   ; 窗口中心在副屏
+                continue
+            pn := WinGetProcessName("ahk_id " h)
+            if pn = "explorer.exe" || pn = "dwm.exe" || pn = "AutoHotkey64.exe"
+                continue
+            if w * hh < minArea
+                continue                        ; 跳过画中画等小窗
+            if IsProcIn(pn, MEDIA_PROCS) {
+                mediaBest := h                  ; 第一个媒体窗口(Z序最前)即目标
+                break
+            }
+            if !best
+                best := h                        ; 非媒体窗口取最上层兜底
+        } catch
+            continue
+    }
+    return mediaBest ? mediaBest : best
+}
+TopWindowOnSec() {
+    global sL, sT, sR, sB
+    for h in WinGetList() {                    ; WinGetList 按Z序(顶层在前)
+        try {
+            if WinGetMinMax("ahk_id " h) = -1
+                continue
+            WinGetPos(&x, &y, &w, &hh, "ahk_id " h)
+            if w <= 0 || hh <= 0
+                continue
+            cx := x + w / 2, cy := y + hh / 2
+            if cx < sL || cx >= sR || cy < sT || cy >= sB
+                continue
+            pn := WinGetProcessName("ahk_id " h)
+            if pn = "explorer.exe" || pn = "dwm.exe" || pn = "AutoHotkey64.exe"
+                continue
+            return h
+        } catch
+            continue
+    }
+    return 0
+}
+IsProcIn(pn, list) {
+    pn := StrLower(pn)                     ; 进程名统一小写(可执行名可能保留大小写)
+    for m in list
+        if pn = m
+            return true
+    return false
+}
+PauseToggle(*) {
+    global suspended, state, PauseHotkey
+    suspended := !suspended
+    if suspended
+        ReleaseClip(), ShowTip("已暂停 · 鼠标完全自由 (" . DisplayHotkey(PauseHotkey) . " 恢复)")
+    else {
+        GetCursor(&x, &y)
+        state := InMain(x, y) ? 0 : 2
+        ShowTip("已恢复锁定")
+    }
+}
+; 退出时释放锁定(回调必须返回 0, 否则 ExitApp 会被取消)
+Cleanup(*) {
+    DllCall("user32.dll\ClipCursor", "Ptr", 0)
+    return 0
+}
+OnExit Cleanup
+
+; ---------- 热键处理 ----------
+RegisterHotkeys(hkUnlock, hkPause) {
+    global UnlockHotkey, PauseHotkey
+    if UnlockHotkey != "" && UnlockHotkey != hkUnlock {
+        Hotkey("*" . UnlockHotkey, UnlockDown, "Off")
+        Hotkey("*" . UnlockHotkey . " up", UnlockUp, "Off")
+    }
+    if PauseHotkey != "" && PauseHotkey != hkPause
+        Hotkey(PauseHotkey, PauseToggle, "Off")
+    if UnlockHotkey != hkUnlock {
+        Hotkey("*" . hkUnlock, UnlockDown, "On")
+        Hotkey("*" . hkUnlock . " up", UnlockUp, "On")
+    }
+    if PauseHotkey != hkPause
+        Hotkey(hkPause, PauseToggle, "On")
+    UnlockHotkey := hkUnlock, PauseHotkey := hkPause
+}
+; 等待用户按下新快捷键; 取消/Esc/超时返回空串
+CaptureHotkey() {
+    ih := InputHook()
+    ih.KeyOpt("{All}", "E")                                    ; 任意键按下即结束
+    ih.KeyOpt("{LControl}{RControl}{LAlt}{RAlt}{LShift}{RShift}{LWin}{RWin}", "-E") ; 纯修饰键不结束
+    ih.Start(), ih.Wait(30)                                    ; 最多等 30 秒
+    if ih.InProgress {
+        ih.Stop()
+        return ""
+    }
+    key := ih.EndKey
+    if ih.EndReason != "EndKey" || key = "Escape" || key = ""
+        return ""
+    return RegExReplace(ih.EndMods, "[<>](.)(?:>\1)?", "$1") . key
+}
+; AHK 记法转可读, 如 "^NumpadMult" → "LCtrl+Num*"; 修饰键统一显示为左键
+DisplayHotkey(hk) {
+    key := RegExReplace(hk, "^[#!^+]+", "")
+    for p in [["NumpadMult", "Num*"], ["NumpadDiv", "Num/"], ["NumpadAdd", "Num+"], ["NumpadSub", "Num-"], ["NumpadEnter", "NumEnter"], ["NumpadDot", "Num."]]
+        key := StrReplace(key, p[1], p[2])
+    key := RegExReplace(key, "^Numpad(\d)$", "Num$1")
+    if StrLen(key) = 1 && RegExMatch(key, "[a-z]")
+        key := Format("{:U}", key)
+    mods := ""
+    if InStr(hk, "#")
+        mods .= "LWin+"
+    if InStr(hk, "!")
+        mods .= "LAlt+"
+    if InStr(hk, "^")
+        mods .= "LCtrl+"
+    if InStr(hk, "+")
+        mods .= "LShift+"
+    return mods . key
+}
+; 修改某一类快捷键; kind: "穿透" | "暂停"
+SetHotkey(kind) {
+    global UnlockHotkey, PauseHotkey, CONFIG
+    isUnlock := kind = "穿透"
+    display := isUnlock ? "穿透" : "暂停/恢复"
+    other := isUnlock ? PauseHotkey : UnlockHotkey
+    ToolTip("修改「" . display . "」快捷键`n当前: " . DisplayHotkey(isUnlock ? UnlockHotkey : PauseHotkey) . "`n请按下新的组合键或单键, 按 Esc 取消")
+    new := CaptureHotkey()
+    ToolTip()
+    if new = ""
+        return ShowTip("已取消修改, 快捷键未变")
+    if new = other
+        return ShowTip("与「" . (isUnlock ? "暂停/恢复" : "穿透") . "」快捷键相同, 请重试")
+    RegisterHotkeys(isUnlock ? new : UnlockHotkey, isUnlock ? PauseHotkey : new)
+    IniWrite(DisplayHotkey(new), CONFIG, "热键", kind)
+    ShowTip("「" . display . "」快捷键已改为: " . DisplayHotkey(new))
+    BuildTrayMenu()
+}
+SetUnlockHotkey(*) => SetHotkey("穿透")
+SetPauseHotkey(*) => SetHotkey("暂停")
+
+; ---------- 托盘设置 ----------
+; 立即按当前锁定模式施加锁定(鼠标当前位置)
+ApplyLockNow() {
+    global lockMode, state
+    GetCursor(&x, &y)
+    if lockMode = "当前屏" && !InMain(x, y)
+        state := 2, ClipToSec()
+    else
+        state := 0, ClipToMain()
+}
+; 锁定模式(托盘切换, 自动记忆)
+SetLockMode(mode) {
+    global lockMode, state, bypass, CONFIG
+    if mode = lockMode
+        return
+    lockMode := mode
+    IniWrite(mode = "主屏" ? "1" : "2", CONFIG, "设置", "lockMode")
+    UpdateMenuChecks()
+    if state = 1 || bypass        ; 穿透中/放行期间: 只记模式, 不立即锁定
+        return ShowTip("锁定模式: " . mode)
+    ApplyLockNow()                                           ; 立即按新模式锁定
+    ShowTip("锁定模式: " . mode)
+}
+LockMainOnly(*) => SetLockMode("主屏")
+LockPerScreen(*) => SetLockMode("当前屏")
+; ---------- 主屏幕选择(托盘, 设备名记忆) ----------
+; 按当前主屏刷新锁定矩形
+RefreshMonitors() {
+    global MAIN_MONITOR, mL, mT, mR, mB, sL, sT, sR, sB, clipRect, clipRectSec
+    MonitorGet(MAIN_MONITOR, &mL, &mT, &mR, &mB)
+    SetRect(clipRect, mL, mT, mR, mB)
+    secMonitor := 0
+    Loop MonitorGetCount() {
+        if A_Index != MAIN_MONITOR {
+            secMonitor := A_Index
+            break
+        }
+    }
+    if secMonitor && MonitorGet(secMonitor, &sL, &sT, &sR, &sB)
+        SetRect(clipRectSec, sL, sT, sR, sB)
+    else
+        SetRect(clipRectSec, mL, mT, mR, mB)
+}
+SetPrimaryMonitor(n) {
+    global MAIN_MONITOR, CONFIG, state, bypass, suspended, lockMode
+    if n = MAIN_MONITOR
+        return
+    MAIN_MONITOR := n
+    IniWrite(MonitorGetName(n), CONFIG, "设置", "primaryMonitor")
+    RefreshMonitors()
+    UpdateMenuChecks()
+    if !bypass && !suspended
+        ApplyLockNow()
+    ShowTip("主屏幕已切换: 显示器" . n)
+}
+; 统一刷新托盘勾选(锁定模式/提示/开机启动/主屏幕)
+UpdateMenuChecks() {
+    global lockMode, showTips, MAIN_MONITOR
+    A_TrayMenu.Uncheck("只锁定主屏"), A_TrayMenu.Uncheck("主副屏单独锁")
+    A_TrayMenu.Check(lockMode = "当前屏" ? "主副屏单独锁" : "只锁定主屏")
+    A_TrayMenu.Uncheck("操作提示")
+    if showTips
+        A_TrayMenu.Check("操作提示")
+    A_TrayMenu.Uncheck("开机启动")
+    if IsAutostart()
+        A_TrayMenu.Check("开机启动")
+    Loop MonitorGetCount()
+        A_TrayMenu.Uncheck("主屏幕: 显示器" . A_Index)
+    A_TrayMenu.Check("主屏幕: 显示器" . MAIN_MONITOR)
+}
+; 闭包工厂: 避免循环变量被回调共享
+PrimaryHandler(n) {
+    return (*) => SetPrimaryMonitor(n)
+}
+; 操作提示开关
+ToggleTips(*) {
+    global showTips, CONFIG
+    showTips := !showTips
+    IniWrite(showTips ? "1" : "0", CONFIG, "设置", "showTips")
+    UpdateMenuChecks()
+    ShowTip(showTips ? "操作提示已开启" : "操作提示已关闭")
+}
+; 开机启动开关(写当前用户 Run 键, 跟随实际运行载体, 默认关闭)
+IsAutostart() {
+    global AUTOSTART_KEY, AUTOSTART_NAME
+    try
+        return RegRead(AUTOSTART_KEY, AUTOSTART_NAME) != ""
+    catch
+        return false
+}
+ToggleAutostart(*) {
+    global AUTOSTART_KEY, AUTOSTART_NAME
+    if IsAutostart()
+        RegDelete(AUTOSTART_KEY, AUTOSTART_NAME), ShowTip("已关闭开机启动")
+    else
+        RegWrite('"' . A_ScriptFullPath . '"', "REG_SZ", AUTOSTART_KEY, AUTOSTART_NAME), ShowTip("已开启开机启动")
+    UpdateMenuChecks()
+}
+
+; ---------- 托盘菜单 ----------
+BuildTrayMenu() {
+    global UnlockHotkey, PauseHotkey, secKey
+    m := A_TrayMenu
+    m.Delete()
+    m.Add("只锁定主屏", LockMainOnly)
+    m.Add("主副屏单独锁", LockPerScreen)
+    m.Add()
+    m.Add("开机启动", ToggleAutostart)
+    m.Add("操作提示", ToggleTips)
+    m.Add()
+    m.Add("穿透键 (" . DisplayHotkey(UnlockHotkey) . ")", SetUnlockHotkey)
+    m.Add("暂停/恢复键 (" . DisplayHotkey(PauseHotkey) . ")", SetPauseHotkey)
+    m.Add("发送到副屏按键 (" . (secKey = "" ? "未设置" : DisplayHotkey(secKey)) . ")", SetSecKey)
+    m.Add()
+    Loop MonitorGetCount()
+        m.Add("主屏幕: 显示器" . A_Index, PrimaryHandler(A_Index))
+    m.Add()
+    m.Add("退出", (*) => ExitApp())
+    UpdateMenuChecks()
+}
+
+; 确保配置文件带注释头(说明热键格式与常用项)
+EnsureIniHeader() {
+    global CONFIG
+    if !FileExist(CONFIG)
+        return
+    c := FileRead(CONFIG)
+    if InStr(c, "双屏鼠标穿透锁定")
+        return
+    head := "; 双屏鼠标穿透锁定 配置文件`n`n"
+    f := FileOpen(CONFIG, "w", "UTF-16")     ; UTF-16: AHK IniWrite 追加时保持同编码, 中文不乱码
+    f.Write(head . c)
+    f.Close()
+}
+
+; ---------- 启动 ----------
+; 按当前主屏刷新锁定矩形(切换主屏幕后也调用)
+RefreshMonitors()
+
+; 配置注释头(首次或缺失时写入)
+EnsureIniHeader()
+; 读取快捷键: 兼容旧AHK记法, 统一转为人类可读存储
+hkUnlock := AhkFromDisplay(IniRead(CONFIG, "热键", "穿透", "^NumpadMult"))
+hkPause := AhkFromDisplay(IniRead(CONFIG, "热键", "暂停", "^NumpadDiv"))
+if IniRead(CONFIG, "热键", "穿透", "") != DisplayHotkey(hkUnlock)
+    IniWrite(DisplayHotkey(hkUnlock), CONFIG, "热键", "穿透")
+if IniRead(CONFIG, "热键", "暂停", "") != DisplayHotkey(hkPause)
+    IniWrite(DisplayHotkey(hkPause), CONFIG, "热键", "暂停")
+; 注册快捷键; 配置异常时回退默认
+try
+    RegisterHotkeys(hkUnlock, hkPause)
+catch
+    RegisterHotkeys("^NumpadMult", "^NumpadDiv")
+SetTimer(LockCheck, POLL_MS)
+
+; 托盘菜单(热键注册后构建, 显示当前按键)
+BuildTrayMenu()
