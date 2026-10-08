@@ -8,6 +8,8 @@
 
 <img width="338" height="316" alt="image" src="https://github.com/user-attachments/assets/a3ca84f2-b103-4fed-bfb4-39321e846caf" />
 
+![演示](按键穿透演示.gif)
+
 ---
 
 ## 一、软件简介
