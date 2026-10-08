@@ -4,8 +4,6 @@
 
 版本：1.2.2　|　适用：Windows 10/11 双屏（双显示器）用户
 
-<img width="125" height="165" alt="image" src="https://github.com/user-attachments/assets/29125846-51da-4ba5-9043-abdf1283080d" />
-
 ![演示](按键穿透演示.gif)
 
 ---
